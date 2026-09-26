@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, redirect, session, url_for, flash, jsonify, send_file  #新增 send_file
+from flask import Flask, render_template, request, redirect, session, url_for, flash, jsonify
 import pyotp
 import bcrypt
 import qrcode
@@ -6,18 +6,17 @@ import base64
 import io
 import os
 import psycopg2
-from cryptography.hazmat.primitives import hashes, serialization   #新增的
-from cryptography.hazmat.primitives.asymmetric import padding   #新增的
-from cryptography.exceptions import InvalidSignature #新增的
+from cryptography.exceptions import InvalidSignature
 from psycopg2.extras import RealDictCursor
-from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
-load_dotenv()
+import requests
 
+load_dotenv()
 
 # 連線到 PostgreSQL（Render 提供 USERDB_URL 和 USERDATADB_URL）
 USERDB_URL = os.environ.get("USERDB_URL")
 USERDATADB_URL = os.environ.get("USERDATADB_URL")
+KMS_URL = os.environ.get("KMS_URL", "http://localhost:6000")
 
 app = Flask(__name__)
 app.secret_key = "secret"
@@ -100,13 +99,16 @@ def register():
         except Exception as e:
             return jsonify({"success": False, "error": "資料庫錯誤：" + str(e)})
 
+        # 註冊成功後，嘗試產生 KMS key pair（若不存在）
+        requests.post(f"{KMS_URL}/kms_register", json=data)
+
         # 成功，產生 QR Code 並轉為 base64
         uri = pyotp.TOTP(otp_secret).provisioning_uri(name=username, issuer_name="MyCloud")
         img = qrcode.make(uri)
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         qr_b64 = base64.b64encode(buf.getvalue()).decode()
-
+        
         return jsonify({"success": True, "qr_b64": qr_b64})
 
     # GET 請求時直接回傳 HTML 表單頁面
@@ -140,7 +142,6 @@ def login():
 
 @app.route("/verify_otp", methods=["POST"])
 def verify_otp():
-    print("Session received username:", session.get("username"))
     username = session.get("username")
     if not username:
         return jsonify(success=False, error="尚未登入")
@@ -190,23 +191,18 @@ def logout():
     session.clear()
     return redirect(url_for("login"))
 
+
 @app.route("/upload", methods=["POST"])
 def upload():
     data = request.get_json()
-
     filename = data.get("filename")
-    enc_file_content = data.get("enc_file_content")
-    enc_data_key = data.get("enc_data_key")
-    nonce = data.get("nonce")
+    enc_file_content = base64.b64decode(data['enc_file_content'])
+    enc_data_key = base64.b64decode(data['enc_data_key'])
+    nonce = base64.b64decode(data['nonce'])
 
     username = session.get("username")
     if not username:
         return jsonify({"status": "error", "message": "未登入"}), 401
-
-    # 轉換成 bytes
-    enc_file_content_bytes = bytes(enc_file_content)
-    enc_data_key_bytes = bytes(enc_data_key)
-    nonce_bytes = bytes(nonce)
 
     try:
         with get_userdata_db_connection() as conn:
@@ -216,117 +212,155 @@ def upload():
                     return jsonify({"success": False, "error": "檔名重複"})
                 cur.execute(
                     "INSERT INTO files (username, filename, content, encrypted_private, nonce) VALUES (%s, %s, %s, %s, %s);",
-                    (username, filename, enc_file_content_bytes, enc_data_key_bytes, nonce_bytes)
+                    (username, filename, enc_file_content, enc_data_key, nonce)
                 )
                 conn.commit()
+
         return jsonify({"status": "success","success": True})
+    
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)})
-    
-# 模擬：使用者對應的公鑰（實際可放資料庫）
-USER_PUBLIC_KEY_PATH = "./static/user_public_keys/user1.pem"
-KMS_PUBLIC_KEY_PATH = "./static/kms_public_key.pem"  # 你真正 KMS 要給的公鑰
+
 
 @app.route('/get_kms_key', methods=['POST'])
 def get_kms_key():
-    data = request.get_json()
     username = session.get("username")
+
     if not username:
         return jsonify({"success": False, "error": "用戶未登入"})
-
+    
     try:
-        signature_data = data['signature']
-
-        # 偵測型態
-        if isinstance(signature_data, str):
-            # base64字串
-            signature = base64.b64decode(signature_data)
-        elif isinstance(signature_data, list):
-            # list of int
-            signature = bytes(signature_data)
-        else:
-            return jsonify({"success": False, "error": "無效的簽章格式"})
-
-        message = data['message'].encode()
-
-        # 從資料庫取出用戶公鑰字串 (PEM格式)
         with get_user_db_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT public_key FROM users WHERE username = %s;", (username,))
-                row = cur.fetchone()
-                if not row:
-                    return jsonify({"success": False, "error": "用戶不存在"})
+                result = cur.fetchone()
+                if not result:
+                    return jsonify({"success": False, "error": "使用者不存在"})
+                user_pub_key = result["public_key"]  # base64 格式的公鑰字串
 
-                public_key_base64 = row['public_key']
 
-        public_key_der = base64.b64decode(public_key_base64)
-        user_public_key = serialization.load_der_public_key(public_key_der)
-        print("2")
-        print("收到的 message: ", message)
-        print("收到的 signature: ", signature)
-        print("資料庫 user_public_key: ", user_public_key)
-        # 驗證簽章
-        user_public_key.verify(
-            signature,
-            message,
-            padding.PKCS1v15(),
-            hashes.SHA256()
+        # 將 public_key 加入 data dict 中
+        data = request.get_json()
+        data["username"] = username            # 可選：提供 username 給 KMS 做紀錄
+        data["user_public_key"] = user_pub_key
+
+
+        # 發送請求到 KMS 的簽章驗證路由
+        verify_response = requests.post(
+            f"{KMS_URL}/kms_verify_signature",
+            json=data,
+            cookies=request.cookies
         )
-        print("3")
 
-        # 驗證成功，讀取 KMS 公鑰並回傳
 
-        with open("./static/kms_public_key.pem", "rb") as f:
-            kms_pub_pem = f.read()
-        print("4")
+        if not verify_response.ok:
+            return jsonify(verify_response.json())
+
+        # 驗證成功後，再取得 KMS 公鑰
+        kms_response = requests.post(
+            f"{KMS_URL}/kms_public_key",
+            json=data,
+            cookies=request.cookies
+        )
+
+        if not kms_response.ok:
+            return jsonify({"success": False, "error": "無法取得 KMS 公鑰"})
+
+        # 回傳驗證結果與 KMS 公鑰
         return jsonify({
             "success": True,
-            "kms_public_key": kms_pub_pem.decode()  # 回傳文字格式 PEM 公鑰
+            "message": "簽章驗證成功",
+            "kms_public_key": kms_response.json().get("public_key")
         })
 
     except InvalidSignature:
         print("❌ 簽章驗證失敗")
         return jsonify({"success": False, "error": "簽章驗證失敗"})
 
-@app.route("/download/<int:file_id>", methods=["GET"])
-def download(file_id):
-    if not session.get("authenticated"):
-        return redirect(url_for("login"))
-
-    try:
-        with get_userdata_db_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT filename, content FROM files WHERE id = %s;", (file_id,))
-                file = cur.fetchone()
-
-        if file:
-            # 下載的檔案直接返回，這裡假設檔案已經是加密過的
-            return send_file(io.BytesIO(file["content"]), download_name=file["filename"], as_attachment=True)
-        else:
-            flash("檔案不存在")
-            return redirect(url_for("WebCrypto_API"))
     except Exception as e:
-        flash("下載失敗：" + str(e))
-        return redirect(url_for("WebCrypto_API"))
+        return jsonify({"success": False, "error": f"系統錯誤：{str(e)}"})
 
-@app.route("/delete", methods=["POST"])
-def delete():
+
+@app.route("/download/<filename>", methods=["POST"])
+def download_file(filename):
     if not session.get("authenticated"):
         return redirect(url_for("login"))
-
-    filename = request.form["delete_filename"]
+    username = session["username"]
+    if not username:
+        return jsonify({"success": False, "error": "未登入使用者"}), 401
     try:
+        with get_user_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT public_key FROM users WHERE username = %s;", (username,))
+                result = cur.fetchone()
+                user_pub_key = result["public_key"]  # base64 格式的公鑰字串
+
+        data = request.get_json()
+        data["username"] = username
+        data["user_public_key"] = user_pub_key
+
+        # 發送請求到 KMS 的簽章驗證路由
+        verify_response = requests.post(
+            f"{KMS_URL}/kms_verify_signature",
+            json=data,
+            cookies=request.cookies
+        )
+        if not verify_response.ok:
+            return jsonify(verify_response.json())
+        
         with get_userdata_db_connection() as conn:
             with conn.cursor() as cur:
-                cur.execute("DELETE FROM files WHERE username = %s AND filename = %s;", (session["username"], filename))
+                cur.execute(
+                    "SELECT content, encrypted_private, nonce FROM files WHERE username = %s AND filename = %s;",
+                    (username, filename)
+                )
+                file_data = cur.fetchone()
+
+        data["encrypted_private"] = base64.b64encode(file_data["encrypted_private"].tobytes()).decode()
+
+        kms_response = requests.post(
+            f"{KMS_URL}/kms_wrapped_AES",
+            json=data,
+            cookies=request.cookies,
+        )
+
+        return jsonify({
+            "success": True,
+            "content": base64.b64encode(file_data["content"].tobytes()).decode(),
+            "encrypted_private": kms_response.json().get("wrapped_key"),
+            "nonce": base64.b64encode(file_data["nonce"].tobytes()).decode()
+        })
+    
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
+
+
+@app.route("/delete/<filename>", methods=["POST"])
+def delete_file(filename):
+    if not session.get("authenticated"):
+        return jsonify({"success": False, "error": "未登入"}), 401
+
+    username = session["username"]
+    if not username:
+        return jsonify({"success": False, "error": "未登入使用者"}), 401
+
+    try:
+        # 刪除檔案
+        with get_userdata_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM files WHERE username = %s AND filename = %s;",
+                    (username, filename)
+                )
                 conn.commit()
-        flash("檔案刪除成功")
-    except Exception as e:
-        flash("刪除失敗：" + str(e))
 
-    return redirect(url_for("WebCrypto_API"))
+        return jsonify({"success": True, "message": f"檔案 {filename} 已刪除"})
+
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
 
 if __name__ == "__main__":
-    init_user_db()  # 初始化 USERDB 資料庫
-    init_userdata_db()  # 初始化 USERDATADB 資料庫
-    app.run(debug=True)
+    init_user_db()
+    init_userdata_db()
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))

@@ -55,8 +55,23 @@
     .logout-btn:hover {
       background-color: #c0392b;
     }
+    button.delete-btn {
+      padding: 6px 12px;
+      font-size: 14px;
+      background-color: #e74c3c;
+      color: white;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      margin-left: 5px;
+    }
+
+    button.delete-btn:hover {
+      background-color: #c0392b;
+    }
   </style>
 </head>
+
 <body>
   <div class="header">
     <div><strong>歡迎，{{ session['username'] }}！</strong></div>
@@ -66,7 +81,7 @@
   </div>
 
   <h3>WebCrypto + 模擬 KMS 公鑰</h3>
-  <button onclick="runDemo()">Run Demo</button>
+  <button onclick="runDemo()">上傳</button>
   <input type="file" id="fileInput" />
   <pre id="output"></pre>
 
@@ -80,7 +95,7 @@
       return bytes.buffer;
     }
 
-    async function getPrivateKeyFromLocalStorage() {
+    async function getPrivateKeysFromLocalStorage() {
       const privateKeyBase64 = localStorage.getItem("privateKey");
       if (!privateKeyBase64) {
         throw new Error("找不到 localStorage 的 privateKey");
@@ -88,7 +103,8 @@
 
       const privateKeyBuffer = base64ToArrayBuffer(privateKeyBase64);
 
-      const privateKey = await window.crypto.subtle.importKey(
+      // 用於簽章的 private key
+      const privateKeySign = await window.crypto.subtle.importKey(
         "pkcs8",
         privateKeyBuffer,
         {
@@ -99,162 +115,351 @@
         ["sign"]
       );
 
-      return privateKey;
+      // 用於解包 AES key 的 private key
+      const privateKeyUnwrap = await window.crypto.subtle.importKey(
+        "pkcs8",
+        privateKeyBuffer,
+        {
+          name: "RSA-OAEP",
+          hash: "SHA-256",
+        },
+        true,
+        ["unwrapKey"]
+      );
+
+      return { privateKeySign, privateKeyUnwrap };
     }
+
     async function runDemo() {
       const output = document.getElementById("output");
-      const privateKey = await getPrivateKeyFromLocalStorage();
-      console.log("Private Key 是：", privateKey);
+      try {
+        const { privateKeySign } = await getPrivateKeysFromLocalStorage();
+        console.log("Private Key 是：", privateKeySign);
 
-      const aesKey = await window.crypto.subtle.generateKey(
-        { name: "AES-GCM", length: 256 },
-        true,
-        ["encrypt", "decrypt", "wrapKey"]
-      );
-      output.textContent += "✅ AES 金鑰已產生\n";
+        const aesKey = await window.crypto.subtle.generateKey(
+          { name: "AES-GCM", length: 256 },
+          true,
+          ["encrypt", "decrypt", "wrapKey"]
+        );
+        output.textContent += "✅ AES 金鑰已產生\n";
 
-      const message = new TextEncoder().encode("I want KMS public key");
+        const message = new TextEncoder().encode("I want KMS public key");
+        const signature = await window.crypto.subtle.sign(
+          { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+          privateKeySign,
+          message
+        );
+        output.textContent += "✅ 成功簽署請求\n";
+        console.log("簽章結果：", new Uint8Array(signature));
+
+        const res = await fetch('/get_kms_key', {
+          method: 'POST',
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            signature: Array.from(new Uint8Array(signature)),
+            message: "I want KMS public key"
+          })
+        });
+
+        const result = await res.json();
+        if (!result.success) {
+          console.error("❌ 驗證失敗：", result.error);
+          output.textContent += "❌ 驗證失敗\n";
+          return;
+        }
+
+        console.log("✅ 簽章驗證成功！");
+        console.log("KMS 公鑰是：", result.kms_public_key);
+
+        const pem = result.kms_public_key;
+        output.textContent += "✅ 收到 KMS 公鑰\n";
+
+        // 安全解析 PEM
+        const pemHeader = "-----BEGIN PUBLIC KEY-----";
+        const pemFooter = "-----END PUBLIC KEY-----";
+
+        const pemHeaderIndex = pem.indexOf(pemHeader);
+        const pemFooterIndex = pem.indexOf(pemFooter);
+
+        if (pemHeaderIndex === -1 || pemFooterIndex === -1) {
+          throw new Error("找不到公鑰 header/footer");
+        }
+
+        const start = pemHeaderIndex + pemHeader.length;
+        const end = pemFooterIndex;
+        let pemContents = pem.substring(start, end);
+        pemContents = pemContents.replace(/\s+/g, "");
+        console.log("PEM contents (Base64):", pemContents);
+
+        // Base64 decode to Uint8Array
+        function base64ToUint8Array(base64) {
+          const binaryString = window.atob(base64);
+          const len = binaryString.length;
+          const bytes = new Uint8Array(len);
+          for (let i = 0; i < len; i++) {
+            bytes[i] = binaryString.charCodeAt(i);
+          }
+          return bytes;
+        }
+        const binaryDer = base64ToUint8Array(pemContents);
+
+        console.log("Binary DER data:", binaryDer);
+        output.textContent += "✅ PEM 轉換完成\n";
+
+        let publicKey;
+        try {
+          publicKey = await window.crypto.subtle.importKey(
+            "spki",
+            binaryDer.buffer,
+            { name: "RSA-OAEP", hash: "SHA-256" },
+            false,
+            ["encrypt", "wrapKey"]
+          );
+          console.log("Public key imported successfully", publicKey);
+        } catch (error) {
+          console.error("Error importing public key: ", error);
+          output.textContent += "❌ 匯入公鑰失敗\n";
+          return;
+        }
+        output.textContent += "✅ 收到並匯入 KMS 公鑰\n";
+
+        const wrappedKey = await window.crypto.subtle.wrapKey(
+          "raw",
+          aesKey,
+          publicKey,
+          { name: "RSA-OAEP" }
+        );
+        output.textContent += "✅ AES 金鑰已用 KMS 公鑰包裝\n";
+
+        const fileInput = document.getElementById("fileInput");
+        const file = fileInput.files[0];
+        if (!file) {
+          output.textContent += "❌ 請先選擇一個檔案\n";
+          return;
+        }
+
+        const reader = new FileReader();
+        reader.onload = async function () {
+          const fileContent = reader.result;
+          const iv = window.crypto.getRandomValues(new Uint8Array(12));
+
+          try {
+            const ciphertext = await window.crypto.subtle.encrypt(
+              { name: "AES-GCM", iv: iv },
+              aesKey,
+              fileContent
+            );
+
+            output.textContent += "✅ 檔案內容已加密\n";
+
+            // 安全的 Base64 encode 函式，避免爆堆疊
+            function toBase64(arr) {
+              let binary = "";
+              const len = arr.length;
+              for (let i = 0; i < len; i++) {
+                binary += String.fromCharCode(arr[i]);
+              }
+              return btoa(binary);
+            }
+
+            const data = {
+              filename: file.name,
+              enc_file_content: toBase64(new Uint8Array(ciphertext)),
+              enc_data_key: toBase64(new Uint8Array(wrappedKey)),
+              nonce: toBase64(iv)
+            };
+
+            const response = await fetch("/upload", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(data)
+            });
+
+            const result = await response.json();
+            if (result.success) {
+              output.textContent += "✅ 上傳成功！\n";
+              location.reload();
+            } else {
+              alert(result.error);
+            }
+          } catch (error) {
+            output.textContent += "❌ 加密過程中發生錯誤\n";
+            console.error(error);
+          }
+        };
+        reader.readAsArrayBuffer(file);
+      } catch (error) {
+        console.error("執行 runDemo 發生錯誤：", error);
+        output.textContent += `❌ 錯誤：${error.message}\n`;
+      }
+    }
+
+    async function downloadFile(filename) {
+      const output = document.getElementById("output");
+      const { privateKeySign, privateKeyUnwrap } = await getPrivateKeysFromLocalStorage();
+      const message = new TextEncoder().encode("I want new wrapped key");
       const signature = await window.crypto.subtle.sign(
         { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
-        privateKey,
+        privateKeySign,
         message
       );
       output.textContent += "✅ 成功簽署請求\n";
       console.log("簽章結果：", new Uint8Array(signature));
 
-      // 2. 把簽章跟請求送到伺服器
-      const res = await fetch('/get_kms_key', {
-        method: 'POST',
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          signature: Array.from(new Uint8Array(signature)),
-          message: "I want KMS public key"
-        })
-      });
+      output.textContent = "正在準備下載文件...\n";
+      try {
+        // 1. 發送請求到後端取得加密檔案、被 RSA 包裝的 AES 金鑰 和 IV
+        const res = await fetch(`/download/${filename}`, {
+          method: 'POST',
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            signature: Array.from(new Uint8Array(signature)),
+            message: "I want new wrapped key"
+          })
+        });
+        if (!res.ok) {
+          throw new Error(`伺服器錯誤：${res.status}`);
+        }
 
-      // 3. 伺服器驗證通過才回傳公鑰
-      //const pem = await res.text();
-      const result = await res.json();
-      if (result.success) {
-        console.log("✅ 簽章驗證成功！");
-        console.log("KMS 公鑰是：", result.kms_public_key);
-      } else {
-        console.log("message", message)
-        console.log("signature base64", btoa(String.fromCharCode(...new Uint8Array(signature))))
-        console.error("❌ 驗證失敗：", result.error);
+        const response = await res.json();
+
+        const encryptedFileBase64 = response.content;
+        const encryptedAesKeyBase64 = response.encrypted_private;
+        const ivBase64 = response.nonce;
+
+        // 2. 轉換為 ArrayBuffer
+        const encryptedFile = Uint8Array.from(atob(encryptedFileBase64), c => c.charCodeAt(0)).buffer;
+        const encryptedAesKey = Uint8Array.from(atob(encryptedAesKeyBase64), c => c.charCodeAt(0)).buffer;
+        const iv = Uint8Array.from(atob(ivBase64), c => c.charCodeAt(0));
+
+        output.textContent += "📦 加密資料載入成功\n";
+
+        // 3. 匯入使用者私鑰
+        const privateKey = await getPrivateKeysFromLocalStorage();
+
+        // 4. 解開 AES 金鑰
+        const aesKey = await window.crypto.subtle.unwrapKey(
+          "raw",                  // 解包後的格式
+          encryptedAesKey,        // 被包裝的 key
+          privateKeyUnwrap,       // RSA 私鑰
+          {
+            name: "RSA-OAEP"
+          },
+          {
+            name: "AES-GCM",
+            length: 256
+          },
+          true,
+          ["decrypt"]
+        );
+
+        output.textContent += "🔑 AES 金鑰成功解封\n";
+
+        // 5. 用 AES 解密檔案
+        const decryptedContent = await window.crypto.subtle.decrypt(
+          {
+            name: "AES-GCM",
+            iv: iv
+          },
+          aesKey,
+          encryptedFile
+        );
+
+        output.textContent += "✅ 檔案解密成功\n";
+
+        // 6. 下載解密後的檔案
+        const blob = new Blob([decryptedContent]);
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = filename; // 保留原檔名
+        a.click();
+        URL.revokeObjectURL(url);
+
+        output.textContent += "📥 檔案已下載\n";
+
+      } catch (error) {
+        output.textContent += `❌ 下載失敗: ${error.message}\n`;
+        console.error(error);
       }
-      const pem = result.kms_public_key;
-      output.textContent += "✅ test1\n";
-  
-
-
-      const pemHeader = "-----BEGIN PUBLIC KEY-----";
-      const pemFooter = "-----END PUBLIC KEY-----";
-
-      const pemHeaderIndex = pem.indexOf(pemHeader);
-      const pemFooterIndex = pem.indexOf(pemFooter);
-
-      if (pemHeaderIndex === -1 || pemFooterIndex === -1) {
-        throw new Error("找不到公鑰 header/footer");
-      }
+    }
     
-      const start = pem.indexOf(pemHeader) + pemHeader.length;
-      const end = pem.indexOf(pemFooter);
-
-      let pemContents = pem.substring(start, end);
-      pemContents = pemContents.replace(/\s+/g, "");
-      console.log("PEM contents (Base64):", pemContents);
-
+    async function importPrivateKey(pem) {
+      const pemHeader = "-----BEGIN PRIVATE KEY-----";
+      const pemFooter = "-----END PRIVATE KEY-----";
+      
+      const pemContents = pem.substring(
+        pem.indexOf(pemHeader) + pemHeader.length,
+        pem.indexOf(pemFooter)
+      ).replace(/\s+/g, '');
+      
       const binaryDerString = window.atob(pemContents);
-      output.textContent += "✅ test1\n";
       const binaryDer = new Uint8Array(binaryDerString.length);
       for (let i = 0; i < binaryDerString.length; i++) {
         binaryDer[i] = binaryDerString.charCodeAt(i);
       }
-  
-      console.log("Binary DER data:", binaryDer);
-      output.textContent += "✅ test1\n";
-      let publicKey;
-  
-      try {
-        publicKey = await window.crypto.subtle.importKey(
-          "spki",
-          binaryDer.buffer,
-          { name: "RSA-OAEP", hash: "SHA-256" },
-          false,
-          ["encrypt", "wrapKey"]
-        );
-        console.log("Public key imported successfully", publicKey);
-      } catch (error) {
-        console.error("Error importing public key: ", error);
-        return;
-      }
-      output.textContent += "✅ test1\n";
-      output.textContent += "✅ KMS 公鑰匯入完成\n";
-
-      const wrappedKey = await window.crypto.subtle.wrapKey(
-        "raw",
-        aesKey,
-        publicKey,
-        { name: "RSA-OAEP" }
+      
+      return await window.crypto.subtle.importKey(
+        "pkcs8",
+        binaryDer,
+        { name: "RSA-OAEP", hash: "SHA-256" },
+        false,
+        ["unwrapKey"]
       );
-      output.textContent += "✅ AES 金鑰已用 KMS 公鑰包裝\n";
-
-      const fileInput = document.getElementById("fileInput");
-      const file = fileInput.files[0];
-
-      if (!file) {
-        output.textContent += "❌ 請先選擇一個檔案\n";
+    }
+    
+    async function deleteFile(filename) {
+      const output = document.getElementById("output");
+      if (!confirm(`確定要刪除檔案 ${filename} 嗎？`)) {
         return;
       }
 
-      const reader = new FileReader();
-      reader.onload = async function () {
-        const fileContent = reader.result;
-        const iv = window.crypto.getRandomValues(new Uint8Array(12));
+      try {
+        // 獲取私鑰用於簽章
+        const { privateKeySign } = await getPrivateKeysFromLocalStorage();
+        
+        // 簽署刪除請求
+        const message = new TextEncoder().encode(`Delete file: ${filename}`);
+        const signature = await window.crypto.subtle.sign(
+          { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+          privateKeySign,
+          message
+        );
 
-        try {
-          const ciphertext = await window.crypto.subtle.encrypt(
-            { name: "AES-GCM", iv: iv },
-            aesKey,
-            fileContent
-          );
+        const response = await fetch(`/delete/${filename}`, {
+          method: 'POST',
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            signature: Array.from(new Uint8Array(signature)),
+            message: `Delete file: ${filename}`
+          })
+        });
 
-          output.textContent += "✅ 檔案內容已加密\n";
-
-          const data = {
-            filename: file.name,
-            enc_file_content: Array.from(new Uint8Array(ciphertext)),
-            enc_data_key: Array.from(new Uint8Array(wrappedKey)),
-            nonce: Array.from(iv)
-          };
-
-          const response = await fetch("/upload", {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json"
-            },
-            body: JSON.stringify(data)
-          });
-
-          const result = await response.json();
-
-          if (result.success) {
-            output.textContent += "✅ 上傳成功！\n";
-            location.reload();
-          } else {
-            alert(result.error);  // ← 跳出檔名重複錯誤提示
-            
-          }
-
-        } catch (error) {
-          output.textContent += "❌ 加密過程中發生錯誤\n";
-          console.error(error);
+        const result = await response.json();
+        if (result.success) {
+          output.textContent += `✅ 檔案 ${filename} 已刪除\n`;
+          location.reload(); // 刷新頁面更新列表
+        } else {
+          output.textContent += `❌ 刪除失敗: ${result.error}\n`;
         }
-      };
-
-      reader.readAsArrayBuffer(file);
+      } catch (error) {
+        output.textContent += `❌ 刪除過程中發生錯誤: ${error.message}\n`;
+        console.error(error);
+      }
     }
+
+
   </script>
 </body>
+<table>
+  {% for file in files %}
+    <tr>
+      <td>{{ file.filename }}</td>
+      <td>
+        <button onclick="downloadFile('{{ file.filename }}')">下載</button>
+        <button onclick="deleteFile('{{ file.filename }}')" style="background-color: #e74c3c; margin-left: 5px;">刪除</button>
+      </td>
+    </tr>
+  {% endfor %}
+</table>
 </html>
